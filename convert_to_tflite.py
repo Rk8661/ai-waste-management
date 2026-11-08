@@ -1,22 +1,28 @@
+"""Convert the trained Keras model to a quantised TFLite model.
+
+Usage:
+    python convert_to_tflite.py [--model best_model.h5] [--out model.tflite]
+"""
+import argparse
+
 import tensorflow as tf
 
-# Load your trained model
-model = tf.keras.models.load_model('best_model.h5')
+from model import load_trained_model
 
-# Export the model to SavedModel format
-model.export('saved_model')  # Correct export method for TFLite
 
-# Convert the SavedModel to TFLite
-converter = tf.lite.TFLiteConverter.from_saved_model('saved_model')
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-converter.target_spec.supported_ops = [
-    tf.lite.OpsSet.TFLITE_BUILTINS,
-    tf.lite.OpsSet.SELECT_TF_OPS
-]
-tflite_model = converter.convert()
+def main():
+    parser = argparse.ArgumentParser(description="Export the Keras model to TFLite.")
+    parser.add_argument("--model", default="best_model.h5")
+    parser.add_argument("--out", default="model.tflite")
+    args = parser.parse_args()
 
-# Save the TFLite model
-with open("model.tflite", "wb") as f:
-    f.write(tflite_model)
+    model = load_trained_model(args.model)
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]  # dynamic-range quantisation
+    with open(args.out, "wb") as f:
+        f.write(converter.convert())
+    print(f"Saved {args.out}")
 
-print("✅ TFLite model saved as model.tflite")
+
+if __name__ == "__main__":
+    main()

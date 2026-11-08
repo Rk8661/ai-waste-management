@@ -16,3 +16,12 @@ venv/
 
 # Datasets or large files (optional)
 dataset/
+# Datasets and generated outputs
+dataset_raw/
+dataset_preprocessed/
+dataset_split/
+saved_model/
+
+# Installers / editor scratch files
+*.sh
+tempCodeRunnerFile.py

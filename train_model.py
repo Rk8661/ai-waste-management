@@ -1,168 +1,134 @@
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, GlobalAveragePooling2D
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.optimizers import Adam
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+"""Fine-tune MobileNetV2 to classify waste as metal, plastic or paper.
+
+Usage:
+    python train_model.py --data dataset_split [--epochs 25]
+
+Expects dataset_split/train/<class>/*.jpg and dataset_split/test/<class>/*.jpg
+(see split_dataset.py). 15% of the training images are held out for
+validation and early stopping, so the test set is only touched once, at the
+end, and the reported test accuracy is an honest estimate.
+"""
+import argparse
+import json
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
+import tensorflow as tf
+from sklearn.metrics import ConfusionMatrixDisplay, classification_report, confusion_matrix
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-import os
-import cv2
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-# Check if TensorFlow is using GPU
-print("Num GPUs Available:", len(tf.config.list_physical_devices('GPU')))
+from config import CLASSES, IMG_SIZE
+from model import build_model
 
-# Set paths to training and testing datasets
-train_dir = "/Users/rohankumbhar/dataset_split/train"
-test_dir = "/Users/rohankumbhar/dataset_split/test"
-
-# Define Image Parameters
-IMG_SIZE = (224, 224)  # Resize images to 224x224
 BATCH_SIZE = 32
+VAL_SPLIT = 0.15
+SEED = 42
 
-# Enhanced Data Augmentation for Training Data
-train_datagen = ImageDataGenerator(
-    rescale=1.0/255.0,     
-    rotation_range=30,    
-    width_shift_range=0.3, 
-    height_shift_range=0.3,
-    shear_range=0.3,
-    zoom_range=0.3,        
-    horizontal_flip=True,
-    brightness_range=[0.8, 1.2],  # Vary brightness
-    fill_mode='nearest'
-)
 
-# No Augmentation for Testing Data (Only Normalization)
-test_datagen = ImageDataGenerator(rescale=1.0/255.0)
+def build_generators(data_dir):
+    train_dir = os.path.join(data_dir, "train")
+    test_dir = os.path.join(data_dir, "test")
 
-# Explicitly set the class order
-classes = ['metal', 'plastic', 'paper']
+    augment = ImageDataGenerator(
+        rescale=1.0 / 255.0,
+        rotation_range=30,
+        width_shift_range=0.3,
+        height_shift_range=0.3,
+        shear_range=0.3,
+        zoom_range=0.3,
+        horizontal_flip=True,
+        brightness_range=[0.8, 1.2],
+        fill_mode="nearest",
+        validation_split=VAL_SPLIT,
+    )
+    # Same split fraction, no augmentation: validation images are the same
+    # files Keras excludes from the training subset above.
+    plain_split = ImageDataGenerator(rescale=1.0 / 255.0, validation_split=VAL_SPLIT)
+    plain = ImageDataGenerator(rescale=1.0 / 255.0)
 
-# Load Training Data
-train_generator = train_datagen.flow_from_directory(
-    train_dir,
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical',
-    classes=classes
-)
-print("Class Indices:", train_generator.class_indices)  # Expected: {'metal': 0, 'plastic': 1, 'paper': 2}
-  
-# Load Testing Data
-test_generator = test_datagen.flow_from_directory(
-    test_dir,
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical',
-    classes=classes
-)
+    common = dict(target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode="categorical", classes=CLASSES)
+    train_gen = augment.flow_from_directory(train_dir, subset="training", seed=SEED, **common)
+    val_gen = plain_split.flow_from_directory(train_dir, subset="validation", shuffle=False, **common)
+    # shuffle=False keeps predictions aligned with test_gen.classes for the confusion matrix
+    test_gen = plain.flow_from_directory(test_dir, shuffle=False, **common)
+    print("Class indices:", train_gen.class_indices)
+    return train_gen, val_gen, test_gen
 
-# Load Pretrained MobileNetV2 Model
-base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
 
-# Freeze Pretrained Layers
-base_model.trainable = True
-fine_tune_at = 100
-for layer in base_model.layers[:fine_tune_at]:
-    layer.trainable = False
+def saliency_box(model, image_path, out_path):
+    """Rough object localisation: box around the pixels with the largest gradient."""
+    import cv2
 
-# Build Model
-model = Sequential([
-    base_model,
-    GlobalAveragePooling2D(),
-    Dense(128, activation='relu'),
-    Dropout(0.5),
-    Dense(3, activation='softmax')  # 3 output classes: Metal, Plastic, Paper
-])
+    img = tf.keras.preprocessing.image.load_img(image_path, target_size=IMG_SIZE)
+    arr = np.expand_dims(tf.keras.preprocessing.image.img_to_array(img), 0) / 255.0
+    tensor = tf.convert_to_tensor(arr)
+    with tf.GradientTape() as tape:
+        tape.watch(tensor)
+        preds = model(tensor)
+        top = preds[:, tf.argmax(preds[0])]
+    sal = tf.reduce_max(tf.abs(tape.gradient(top, tensor)[0]), axis=-1).numpy()
+    sal = np.uint8(255 * (sal - sal.min()) / (sal.max() - sal.min() + 1e-8))
 
-# Print model summary
-model.summary()
+    _, mask = cv2.threshold(sal, 100, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    drawn = np.uint8(arr[0] * 255).copy()
+    if contours:
+        x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+        cv2.rectangle(drawn, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    plt.figure(figsize=(6, 6))
+    plt.imshow(drawn)
+    plt.axis("off")
+    plt.title("Approximate object location (saliency)")
+    plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
 
-# Compile the Model with Lower Learning Rate
-model.compile(
-    optimizer=Adam(learning_rate=0.0001),  # Reduced from 0.001 to 0.0001
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
 
-# Train the Model with More Epochs
-EPOCHS = 25  
+def main():
+    parser = argparse.ArgumentParser(description="Train the waste classifier.")
+    parser.add_argument("--data", default="dataset_split", help="Folder containing train/ and test/")
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--out", default="best_model.h5", help="Where to save the best model")
+    parser.add_argument("--weights", default="imagenet", help="'imagenet' or 'none' (random init)")
+    args = parser.parse_args()
 
-callbacks = [
-    EarlyStopping(patience=5, restore_best_weights=True),
-    ModelCheckpoint("best_model.h5", save_best_only=True)
-]
+    print("GPUs available:", len(tf.config.list_physical_devices("GPU")))
+    train_gen, val_gen, test_gen = build_generators(args.data)
+    model = build_model(None if args.weights == "none" else args.weights)
+    model.summary()
 
-history = model.fit(
-    train_generator,
-    epochs=EPOCHS,
-    validation_data=test_generator,
-    callbacks=callbacks
-)
+    model.fit(
+        train_gen,
+        epochs=args.epochs,
+        validation_data=val_gen,
+        callbacks=[
+            EarlyStopping(patience=5, restore_best_weights=True),
+            ModelCheckpoint(args.out, save_best_only=True),
+        ],
+    )
 
-# Evaluate the Model
-test_loss, test_acc = model.evaluate(test_generator)
-print(f"Test Accuracy: {test_acc * 100:.2f}%")
+    # Final, one-time evaluation on the held-out test set
+    test_loss, test_acc = model.evaluate(test_gen)
+    y_pred = np.argmax(model.predict(test_gen), axis=1)
+    y_true = test_gen.classes
+    report = classification_report(y_true, y_pred, target_names=CLASSES, output_dict=True, zero_division=0)
+    print(f"Test accuracy: {test_acc * 100:.2f}%")
+    print(classification_report(y_true, y_pred, target_names=CLASSES, zero_division=0))
 
-# Generate Confusion Matrix
-y_true = test_generator.classes
-y_pred_probs = model.predict(test_generator)
-y_pred = np.argmax(y_pred_probs, axis=1)
+    os.makedirs("results", exist_ok=True)
+    with open("results/metrics.json", "w") as f:
+        json.dump({"test_accuracy": test_acc, "test_loss": test_loss, "per_class": report}, f, indent=2)
 
-# Get class labels in the same order
-class_labels = list(test_generator.class_indices.keys())
+    disp = ConfusionMatrixDisplay(confusion_matrix(y_true, y_pred), display_labels=CLASSES)
+    disp.plot(cmap="Blues", values_format="d")
+    plt.title("Confusion matrix (test set)")
+    plt.savefig("results/confusion_matrix.png", bbox_inches="tight")
+    plt.close()
 
-# Compute and plot confusion matrix
-cm = confusion_matrix(y_true, y_pred)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels)
-plt.figure(figsize=(6, 6))
-disp.plot(cmap='Blues', values_format='d')
-plt.title("Confusion Matrix")
-plt.show()
+    saliency_box(model, test_gen.filepaths[0], "results/saliency_example.png")
+    print("Saved model to", args.out, "and metrics/plots to results/")
 
-# Save the Model
-model.save("/Users/rohankumbhar/python/waste_classifier.h5")
-print("Model saved successfully!")
 
-# Visualize the region influencing the prediction
-img_path = test_generator.filepaths[0]
-img = tf.keras.preprocessing.image.load_img(img_path, target_size=IMG_SIZE)
-img_array = tf.keras.preprocessing.image.img_to_array(img)
-img_array = np.expand_dims(img_array, axis=0) / 255.0
-
-# Use GradientTape to get gradients of the top predicted class
-img_tensor = tf.convert_to_tensor(img_array)
-with tf.GradientTape() as tape:
-    tape.watch(img_tensor)
-    preds = model(img_tensor)
-    top_pred_index = tf.argmax(preds[0])
-    top_class_channel = preds[:, top_pred_index]
-
-grads = tape.gradient(top_class_channel, img_tensor)[0]
-saliency = tf.reduce_max(tf.abs(grads), axis=-1).numpy()
-
-# Normalize and convert to uint8
-saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min())
-saliency = np.uint8(saliency * 255)
-
-# Threshold and find contours
-_, binary_map = cv2.threshold(saliency, 100, 255, cv2.THRESH_BINARY)
-contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-# Draw bounding box
-img_to_draw = np.uint8(img_array[0] * 255).copy()
-if contours:
-    largest_contour = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(largest_contour)
-    cv2.rectangle(img_to_draw, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-# Show result
-plt.figure(figsize=(6, 6))
-plt.imshow(img_to_draw)
-plt.axis('off')
-plt.title("Approximate Object Detection via Saliency Map")
-plt.show()
+if __name__ == "__main__":
+    main()

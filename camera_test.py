@@ -1,75 +1,64 @@
+"""Live webcam classification. Press 'q' to quit.
+
+Usage:
+    python camera_test.py [--model best_model.h5] [--camera 0] [--threshold 60]
+"""
+import argparse
+
 import cv2
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import load_model
 
-# Load the trained model
-model = load_model("/Users/rohankumbhar/python/best_model.h5")
+from config import CLASSES, preprocess
+from model import load_trained_model
 
-# Define class labels (make sure the order matches your training dataset)
-class_labels = ["metal", "plastic", "Paper"]
 
-# Open the webcam
-cap = cv2.VideoCapture(0)
+def main():
+    parser = argparse.ArgumentParser(description="Classify waste from a webcam feed.")
+    parser.add_argument("--model", default="best_model.h5", help="Path to the Keras model")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index")
+    parser.add_argument("--threshold", type=float, default=60.0,
+                        help="Minimum confidence (%%) before a label is shown")
+    args = parser.parse_args()
 
-if not cap.isOpened():
-    print("Error: Cannot access camera")
-    exit()
+    model = load_trained_model(args.model)
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        raise SystemExit("Error: cannot access camera")
 
-print("Press 'q' to quit")
+    print("Press 'q' to quit")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: failed to grab frame")
+            break
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Error: Failed to grab frame")
-        break
+        # Crop to the centre square so the object fills the model's view
+        h, w, _ = frame.shape
+        side = min(h, w)
+        x0, y0 = (w - side) // 2, (h - side) // 2
+        crop = cv2.GaussianBlur(frame[y0:y0 + side, x0:x0 + side], (5, 5), 0)
 
-    # Crop to center square for better object focus
-    h, w, _ = frame.shape
-    min_dim = min(h, w)
-    start_x = (w - min_dim) // 2
-    start_y = (h - min_dim) // 2
-    cropped = frame[start_y:start_y + min_dim, start_x:start_x + min_dim]
+        # OpenCV frames are BGR; the model was trained on RGB images
+        batch = preprocess(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        probs = model.predict(batch, verbose=0)[0]
+        idx = int(np.argmax(probs))
+        confidence = probs[idx] * 100
 
-    # Apply Gaussian blur to reduce noise
-    cropped = cv2.GaussianBlur(cropped, (5, 5), 0)
+        if confidence > args.threshold:
+            text = f"{CLASSES[idx]} ({confidence:.1f}%)"
+            cv2.rectangle(frame, (x0, y0), (x0 + side, y0 + side), (0, 0, 255), 2)
+            cv2.putText(frame, text, (x0, max(y0 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        else:
+            text = "Uncertain"
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-    # Resize and preprocess the frame
-    img = cv2.resize(cropped, (224, 224))
-    img = tf.keras.applications.mobilenet_v2.preprocess_input(img)
-    img = np.expand_dims(img, axis=0)
+        cv2.imshow("Waste Classification - press q to quit", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
-    # Predict the class
-    prediction = model.predict(img)
-    class_index = np.argmax(prediction)
-    confidence = prediction[0][class_index] * 100
+    cap.release()
+    cv2.destroyAllWindows()
 
-    # Debug: print confidence for all classes
-    print("Class Probabilities:")
-    for i, prob in enumerate(prediction[0]):
-        print(f"{class_labels[i]}: {prob * 100:.2f}%")
 
-    # Display prediction only if confidence is high
-    if confidence > 60:
-        label = class_labels[class_index]
-        display_text = f"{label} ({confidence:.2f}%)"
-        # Draw red rectangle on the cropped area
-        cv2.rectangle(frame, (start_x, start_y), (start_x + min_dim, start_y + min_dim), (0, 0, 255), 2)
-        # Put label near the rectangle
-        cv2.putText(frame, display_text, (start_x, start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-    else:
-        display_text = "Uncertain"
-
-    # Show prediction on the frame
-    cv2.putText(frame, display_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-    # Display the frame
-    cv2.imshow("Waste Classification - Press 'q' to Quit", frame)
-
-    # Quit when 'q' is pressed
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# Release resources
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
